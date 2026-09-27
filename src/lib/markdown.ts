@@ -1,4 +1,4 @@
-import type { GlossaryTerm, Segment, SegmentKind, TranslationIssue } from './types'
+import type { BrokenAnchorLink, GlossaryTerm, Segment, SegmentKind, TocLinkRewrite, TocSyncResult, TranslationIssue } from './types'
 
 const variablePattern = /\{\{[^{}]+\}\}|\{[A-Za-z_][\w.-]*\}|%\([^)]+\)[sd]|%[sd]/g
 const linkPattern = /\[[^\]]+\]\(([^)]+)\)/g
@@ -71,8 +71,108 @@ export const analyzeSegment = (segment: Segment, glossary: GlossaryTerm[]): Tran
   return issues
 }
 
-export const analyzeDocument = (segments: Segment[], glossary: GlossaryTerm[]) =>
-  segments.flatMap((segment) => segment.status === 'confirmed' ? [] : analyzeSegment(segment, glossary))
+export const analyzeDocument = (segments: Segment[], glossary: GlossaryTerm[]) => {
+  const issues = segments.flatMap((segment) => segment.status === 'confirmed' ? [] : analyzeSegment(segment, glossary))
+  for (const broken of syncTocLinks(segments).brokenLinks) {
+    issues.push({
+      id: `${broken.segmentId}-anchor-${broken.anchor}`,
+      segmentId: broken.segmentId,
+      type: 'anchor-mismatch' as const,
+      severity: 'error' as const,
+      message: `目录链接 ${broken.anchor} 在译文中找不到目标标题（位于“${broken.heading}”），导出后会失效。`,
+      expected: broken.anchor,
+    })
+  }
+  return issues
+}
 
 export const renderTargetMarkdown = (segments: Segment[]) =>
   segments.map((segment) => segment.targetText || segment.sourceText).join('\n\n')
+
+const explicitAnchorPattern = /\{#([A-Za-z0-9_:.-]+)\}\s*$/
+const headingLinePattern = /^(#{1,6})\s+(.+?)\s*$/
+// 目录等文内跳转链接：仅匹配以 # 开头的片段链接，外部 URL（含其片段）不受影响
+const tocLinkPattern = () => /\[([^\]]+)\]\((#[^)\s]+)([^)]*)\)/g
+
+export interface ParsedHeading {
+  level: number
+  text: string
+  explicitAnchor: string | null
+}
+
+export const parseHeading = (block: string): ParsedHeading | null => {
+  const match = block.split('\n', 1)[0].match(headingLinePattern)
+  if (!match) return null
+  let text = match[2]
+  let explicitAnchor: string | null = null
+  const anchorMatch = text.match(explicitAnchorPattern)
+  if (anchorMatch) {
+    explicitAnchor = anchorMatch[1]
+    text = text.slice(0, anchorMatch.index).trim()
+  }
+  return { level: match[1].length, text, explicitAnchor }
+}
+
+// 与 GitHub / 常见文档站一致的标题锚点规则：小写、去标点、空格转连字符，保留中日韩等文字
+export const slugifyHeading = (text: string): string =>
+  text
+    .replace(/<[^>]+>/g, '')
+    .replace(/\[([^\]]*)\]\([^)]*\)/g, '$1')
+    .replace(/[`*~]/g, '')
+    .trim()
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}\p{M}_\- ]/gu, '')
+    .replace(/\s+/g, '-')
+
+// 依次计算一组内容块中标题的锚点；作者写明的 {#anchor} 优先，自动锚点重复时按出现顺序加 -1、-2 后缀
+export const buildHeadingAnchors = (blocks: string[]): (string | null)[] => {
+  const seen = new Map<string, number>()
+  return blocks.map((block) => {
+    const heading = parseHeading(block)
+    if (!heading) return null
+    if (heading.explicitAnchor) return heading.explicitAnchor
+    const base = slugifyHeading(heading.text)
+    const occurrence = seen.get(base) ?? 0
+    seen.set(base, occurrence + 1)
+    return occurrence ? `${base}-${occurrence}` : base
+  })
+}
+
+const findContainingHeading = (blocks: string[], position: number): string => {
+  for (let index = position; index >= 0; index--) {
+    const heading = parseHeading(blocks[index])
+    if (heading) return heading.text
+  }
+  return '文档开头'
+}
+
+// 根据译文标题重算锚点并同步目录链接；找不到目标的链接会被记录，用于导出前拦截
+export const syncTocLinks = (segments: Segment[]): TocSyncResult => {
+  const exportTexts = segments.map((segment) => segment.targetText || segment.sourceText)
+  const sourceAnchors = buildHeadingAnchors(segments.map((segment) => segment.sourceText))
+  const exportAnchors = buildHeadingAnchors(exportTexts)
+  const exportAnchorSet = new Set(exportAnchors.filter((anchor): anchor is string => Boolean(anchor)))
+  const rewriteMap = new Map<string, string>()
+  segments.forEach((_, index) => {
+    const from = sourceAnchors[index]
+    const to = exportAnchors[index]
+    if (from && to && from !== to) rewriteMap.set(from, to)
+  })
+  const rewrites: TocLinkRewrite[] = []
+  const brokenLinks: BrokenAnchorLink[] = []
+  const syncedTexts = segments.map((segment, index) => {
+    const synced = exportTexts[index].replace(tocLinkPattern(), (whole, label: string, anchor: string, suffix: string) => {
+      const next = rewriteMap.get(anchor.slice(1))
+      if (!next) return whole
+      rewrites.push({ segmentId: segment.id, from: anchor, to: `#${next}` })
+      return `[${label}](#${next}${suffix})`
+    })
+    for (const match of synced.matchAll(tocLinkPattern())) {
+      if (!exportAnchorSet.has(match[2].slice(1))) {
+        brokenLinks.push({ segmentId: segment.id, anchor: match[2], linkText: match[1], heading: findContainingHeading(exportTexts, index) })
+      }
+    }
+    return synced
+  })
+  return { markdown: syncedTexts.join('\n\n'), rewrites, brokenLinks }
+}

@@ -1,6 +1,6 @@
 export type SegmentKind = 'heading' | 'paragraph' | 'code' | 'link' | 'variable'
 export type SegmentStatus = 'draft' | 'needs-work' | 'confirmed' | 'returned'
-export type IssueType = 'missing-translation' | 'missing-variable' | 'link-mismatch' | 'glossary' | 'code-format'
+export type IssueType = 'missing-translation' | 'missing-variable' | 'link-mismatch' | 'glossary' | 'code-format' | 'anchor-mismatch'
 export type IssueSeverity = 'error' | 'warning'
 
 export interface Segment {
@@ -38,6 +38,25 @@ export interface TranslationIssue {
   severity: IssueSeverity
   message: string
   expected?: string
+}
+
+export interface TocLinkRewrite {
+  segmentId: string
+  from: string
+  to: string
+}
+
+export interface BrokenAnchorLink {
+  segmentId: string
+  anchor: string
+  linkText: string
+  heading: string
+}
+
+export interface TocSyncResult {
+  markdown: string
+  rewrites: TocLinkRewrite[]
+  brokenLinks: BrokenAnchorLink[]
 }
 
 export interface HistoryEntry {

@@ -15,9 +15,9 @@ import { Input } from '@/components/ui/input'
 import { Progress } from '@/components/ui/progress'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { Textarea } from '@/components/ui/textarea'
-import { analyzeDocument, extractVariables, parseMarkdown, renderTargetMarkdown } from '@/lib/markdown'
+import { analyzeDocument, extractVariables, parseMarkdown, syncTocLinks } from '@/lib/markdown'
 import { seedConflicts, seedDiscussions, seedDocument, seedGlossary, seedHistory, seedSegments } from '@/lib/seed'
-import type { Discussion, GlossaryTerm, HistoryEntry, Segment, SegmentStatus, TranslationConflict, TranslationIssue } from '@/lib/types'
+import type { BrokenAnchorLink, Discussion, GlossaryTerm, HistoryEntry, Segment, SegmentStatus, TranslationConflict, TranslationIssue } from '@/lib/types'
 import { cn } from '@/lib/utils'
 
 const DRAFT_KEY = 'sologsb-1003-localization-draft-v1'
@@ -29,7 +29,7 @@ const statusClass: Record<SegmentStatus, string> = {
   confirmed: 'bg-emerald-100 text-emerald-800', returned: 'bg-red-100 text-red-800',
 }
 const issueLabel: Record<TranslationIssue['type'], string> = {
-  'missing-translation': '漏译', 'missing-variable': '变量缺失', 'link-mismatch': '链接不一致', glossary: '术语不一致', 'code-format': '代码格式',
+  'missing-translation': '漏译', 'missing-variable': '变量缺失', 'link-mismatch': '链接不一致', glossary: '术语不一致', 'code-format': '代码格式', 'anchor-mismatch': '锚点失效',
 }
 const clone = <T,>(value: T): T => JSON.parse(JSON.stringify(value)) as T
 
@@ -57,6 +57,7 @@ export function LocalizationWorkbench() {
   const [hydrated, setHydrated] = useState(false)
   const [past, setPast] = useState<EditorSnapshot[]>([])
   const [future, setFuture] = useState<EditorSnapshot[]>([])
+  const [exportBlockers, setExportBlockers] = useState<BrokenAnchorLink[] | null>(null)
 
   const documentQuery = useQuery({
     queryKey: ['localization-document'],
@@ -117,6 +118,7 @@ export function LocalizationWorkbench() {
   })
 
   const liveIssues = useMemo(() => analyzeDocument(segments, glossary), [segments, glossary])
+  const tocSync = useMemo(() => syncTocLinks(segments), [segments])
   const issues = checkedIssues ?? liveIssues
   const issueMap = useMemo(() => issues.reduce<Record<string, TranslationIssue[]>>((map, issue) => {
     map[issue.segmentId] = [...(map[issue.segmentId] ?? []), issue]
@@ -259,7 +261,11 @@ export function LocalizationWorkbench() {
     event.target.value = ''
   }
   const exportMarkdown = () => {
-    const blob = new Blob([renderTargetMarkdown(segments)], { type: 'text/markdown;charset=utf-8' })
+    if (tocSync.brokenLinks.length) {
+      setExportBlockers(tocSync.brokenLinks)
+      return
+    }
+    const blob = new Blob([tocSync.markdown], { type: 'text/markdown;charset=utf-8' })
     const url = URL.createObjectURL(blob)
     const anchor = document.createElement('a')
     anchor.href = url
@@ -323,6 +329,9 @@ export function LocalizationWorkbench() {
           <span className="flex items-center gap-1"><CheckCheck className="h-3.5 w-3.5 text-emerald-600" /><b className="text-slate-900">{confirmedCount}</b> 已确认</span>
           <div className="ml-auto flex min-w-[220px] items-center gap-3"><span>审校进度 {progress}%</span><Progress value={progress} className="w-36" /></div>
           <Button size="sm" variant="secondary" onClick={() => checkMutation.mutate()} disabled={checkMutation.isPending}>{checkMutation.isPending ? <Loader2 className="h-4 w-4 animate-spin" /> : <ShieldCheck className="h-4 w-4" />}运行本地术语检查</Button>
+          {tocSync.brokenLinks.length > 0
+            ? <Button size="sm" variant="destructive" onClick={() => setExportBlockers(tocSync.brokenLinks)}><Link2 className="h-4 w-4" />{tocSync.brokenLinks.length} 个目录链接失效</Button>
+            : tocSync.rewrites.length > 0 && <Badge variant="secondary" className="gap-1"><Link2 className="h-3 w-3" />目录锚点已同步 {tocSync.rewrites.length} 处</Badge>}
           <Button size="sm" variant="outline" onClick={exportMarkdown}><Download className="h-4 w-4" />导出译文</Button>
         </div>
       </div>
@@ -421,6 +430,33 @@ export function LocalizationWorkbench() {
       </main>
 
       {selectedForReturn.size > 0 && <div className="fixed bottom-0 left-0 right-0 z-50 border-t bg-slate-950 px-4 py-3 text-white shadow-2xl"><div className="mx-auto flex max-w-[1800px] items-center gap-3"><ShieldCheck className="h-4 w-4 text-amber-300" /><span className="text-xs">已选择 <b>{selectedForReturn.size}</b> 个片段</span><Input value={returnReason} onChange={(event) => setReturnReason(event.target.value)} className="ml-auto max-w-lg border-slate-700 bg-slate-900 text-white" /><Button variant="destructive" size="sm" onClick={bulkReturn}>确认批量退回</Button><Button variant="ghost" size="sm" className="text-slate-300" onClick={() => setSelectedForReturn(new Set())}>取消</Button></div></div>}
+
+      {exportBlockers && (
+        <div className="fixed inset-0 z-[70] flex items-center justify-center bg-slate-950/60 p-4" role="alertdialog" aria-modal="true" aria-label="导出已拦截">
+          <div className="w-full max-w-xl overflow-hidden rounded-xl border bg-white shadow-2xl">
+            <div className="border-b bg-red-50 px-5 py-4">
+              <h2 className="flex items-center gap-2 text-sm font-semibold text-red-800"><CircleAlert className="h-4 w-4" />导出已拦截：{exportBlockers.length} 个目录链接找不到目标标题</h2>
+              <p className="mt-1.5 text-xs leading-5 text-red-600">这些链接导出到文档站后会失效。请根据所在标题定位并修复链接，或调整对应标题的译文 / 锚点后再导出。</p>
+            </div>
+            <ul className="max-h-80 space-y-2 overflow-auto px-5 py-4">
+              {exportBlockers.map((broken, index) => (
+                <li key={`${broken.segmentId}-${broken.anchor}-${index}`}>
+                  <button className="w-full rounded-lg border border-red-100 bg-red-50/40 p-3 text-left transition hover:border-red-300 hover:bg-red-50" onClick={() => { setExportBlockers(null); selectAndScroll(broken.segmentId) }}>
+                    <div className="flex items-center justify-between gap-2">
+                      <code className="text-xs font-semibold text-red-700">[{broken.linkText}]({broken.anchor})</code>
+                      <span className="shrink-0 text-[10px] text-slate-400">片段 #{segments.find((item) => item.id === broken.segmentId)?.index ?? '—'}</span>
+                    </div>
+                    <p className="mt-1.5 text-[11px] text-slate-600">所在标题：<b className="text-slate-800">{broken.heading}</b><span className="ml-2 text-blue-600">点击定位 →</span></p>
+                  </button>
+                </li>
+              ))}
+            </ul>
+            <div className="flex justify-end border-t bg-slate-50 px-5 py-3">
+              <Button size="sm" onClick={() => setExportBlockers(null)}>返回修改</Button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   )
 }
