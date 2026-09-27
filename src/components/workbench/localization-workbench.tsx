@@ -15,7 +15,7 @@ import { Input } from '@/components/ui/input'
 import { Progress } from '@/components/ui/progress'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { Textarea } from '@/components/ui/textarea'
-import { analyzeDocument, extractVariables, parseMarkdown, renderTargetMarkdown } from '@/lib/markdown'
+import { analyzeDocument, computeHeadingAnchors, extractVariables, findBrokenAnchorLinks, parseMarkdown, renderTargetMarkdown, syncAnchorLinks, type BrokenAnchorLink } from '@/lib/markdown'
 import { seedConflicts, seedDiscussions, seedDocument, seedGlossary, seedHistory, seedSegments } from '@/lib/seed'
 import type { Discussion, GlossaryTerm, HistoryEntry, Segment, SegmentStatus, TranslationConflict, TranslationIssue } from '@/lib/types'
 import { cn } from '@/lib/utils'
@@ -57,6 +57,8 @@ export function LocalizationWorkbench() {
   const [hydrated, setHydrated] = useState(false)
   const [past, setPast] = useState<EditorSnapshot[]>([])
   const [future, setFuture] = useState<EditorSnapshot[]>([])
+  const [exportBlock, setExportBlock] = useState<BrokenAnchorLink[] | null>(null)
+  const initialAnchorSync = useRef(false)
 
   const documentQuery = useQuery({
     queryKey: ['localization-document'],
@@ -160,6 +162,12 @@ export function LocalizationWorkbench() {
   }, [discussions, glossary, history, hydrated, segments])
 
   useEffect(() => {
+    if (!hydrated || initialAnchorSync.current) return
+    initialAnchorSync.current = true
+    setSegments((current) => syncAnchorLinks(current).segments)
+  }, [hydrated])
+
+  useEffect(() => {
     const beforeUnload = (event: BeforeUnloadEvent) => {
       if (!dirty) return
       event.preventDefault()
@@ -182,8 +190,16 @@ export function LocalizationWorkbench() {
     if (markDirty) setDirty(true)
   }
   const updateTarget = (segment: Segment, targetText: string) => {
-    const next = segments.map((item) => item.id === segment.id ? { ...item, targetText, status: item.status === 'confirmed' ? 'draft' as const : item.status } : item)
+    const previousAnchors = segment.kind === 'heading' ? computeHeadingAnchors(segments) : undefined
+    let next = segments.map((item) => item.id === segment.id ? { ...item, targetText, status: item.status === 'confirmed' ? 'draft' as const : item.status } : item)
+    let synced = 0
+    if (previousAnchors) {
+      const result = syncAnchorLinks(next, previousAnchors)
+      next = result.segments
+      synced = result.updated
+    }
     replaceState({ segments: next, discussions: clone(discussions) })
+    if (synced) pushHistoryEntry(segment.id, 'edit', '', `标题锚点变化，已同步 ${synced} 处目录链接`, '系统 · 锚点同步')
   }
   const updateStatus = (segmentId: string, status: SegmentStatus, action: HistoryEntry['action'] = status === 'confirmed' ? 'confirm' : 'return') => {
     const segment = segments.find((item) => item.id === segmentId)
@@ -243,7 +259,9 @@ export function LocalizationWorkbench() {
   const resolveConflict = (conflict: TranslationConflict, strategy: 'local' | 'remote') => {
     const targetText = strategy === 'local' ? conflict.localText : conflict.remoteText
     const segment = segments.find((item) => item.id === conflict.segmentId)
-    const next = segments.map((item) => item.id === conflict.segmentId ? { ...item, targetText, status: 'draft' as const } : item)
+    const previousAnchors = segment?.kind === 'heading' ? computeHeadingAnchors(segments) : undefined
+    let next = segments.map((item) => item.id === conflict.segmentId ? { ...item, targetText, status: 'draft' as const } : item)
+    if (previousAnchors) next = syncAnchorLinks(next, previousAnchors).segments
     replaceState({ segments: next, discussions: clone(discussions) })
     if (segment) pushHistoryEntry(segment.id, 'resolve-conflict', segment.targetText, targetText, strategy === 'local' ? '保留本地' : conflict.remoteAuthor)
     setConflicts((current) => current.filter((item) => item.id !== conflict.id))
@@ -259,6 +277,12 @@ export function LocalizationWorkbench() {
     event.target.value = ''
   }
   const exportMarkdown = () => {
+    const broken = findBrokenAnchorLinks(segments)
+    if (broken.length) {
+      setExportBlock(broken)
+      return
+    }
+    setExportBlock(null)
     const blob = new Blob([renderTargetMarkdown(segments)], { type: 'text/markdown;charset=utf-8' })
     const url = URL.createObjectURL(blob)
     const anchor = document.createElement('a')
@@ -421,6 +445,34 @@ export function LocalizationWorkbench() {
       </main>
 
       {selectedForReturn.size > 0 && <div className="fixed bottom-0 left-0 right-0 z-50 border-t bg-slate-950 px-4 py-3 text-white shadow-2xl"><div className="mx-auto flex max-w-[1800px] items-center gap-3"><ShieldCheck className="h-4 w-4 text-amber-300" /><span className="text-xs">已选择 <b>{selectedForReturn.size}</b> 个片段</span><Input value={returnReason} onChange={(event) => setReturnReason(event.target.value)} className="ml-auto max-w-lg border-slate-700 bg-slate-900 text-white" /><Button variant="destructive" size="sm" onClick={bulkReturn}>确认批量退回</Button><Button variant="ghost" size="sm" className="text-slate-300" onClick={() => setSelectedForReturn(new Set())}>取消</Button></div></div>}
+
+      {exportBlock && (
+        <div className="fixed inset-0 z-50 grid place-items-center bg-slate-950/60 p-4" onClick={() => setExportBlock(null)}>
+          <div className="w-full max-w-lg overflow-hidden rounded-xl border bg-white shadow-2xl" onClick={(event) => event.stopPropagation()}>
+            <header className="flex items-center gap-2 border-b bg-red-50 px-4 py-3">
+              <CircleAlert className="h-4 w-4 text-red-600" />
+              <b className="text-sm text-red-800">导出已拦截：{exportBlock.length} 处目录链接找不到目标标题</b>
+              <button className="ml-auto text-slate-400 hover:text-slate-700" onClick={() => setExportBlock(null)} aria-label="关闭"><X className="h-4 w-4" /></button>
+            </header>
+            <p className="px-4 pt-3 text-[11px] leading-relaxed text-slate-500">以下链接在译文中没有可跳转的标题锚点，导出到文档站后会失效。请修正链接或补译对应标题后重试。</p>
+            <ul className="max-h-72 space-y-2 overflow-auto p-4">
+              {exportBlock.map((item, index) => (
+                <li key={`${item.segmentId}-${item.href}-${index}`} className="flex items-center gap-3 rounded-lg border border-red-100 bg-red-50/50 px-3 py-2.5">
+                  <Link2 className="h-3.5 w-3.5 shrink-0 text-red-500" />
+                  <div className="min-w-0 flex-1">
+                    <code className="text-xs font-semibold text-red-700">{item.href}</code>
+                    <p className="mt-0.5 truncate text-[10px] text-slate-500">所在标题：{item.sectionTitle ? `《${item.sectionTitle}》` : '文档开头（目录区）'} · 片段 #{item.segmentIndex}</p>
+                  </div>
+                  <Button size="sm" variant="outline" className="shrink-0" onClick={() => { setExportBlock(null); selectAndScroll(item.segmentId) }}>定位</Button>
+                </li>
+              ))}
+            </ul>
+            <footer className="flex justify-end gap-2 border-t px-4 py-3">
+              <Button size="sm" variant="secondary" onClick={() => setExportBlock(null)}>返回修改</Button>
+            </footer>
+          </div>
+        </div>
+      )}
     </div>
   )
 }
